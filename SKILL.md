@@ -6,28 +6,46 @@ description: Summarize videos by extracting subtitles or transcribing audio. Use
 
 Extract video transcript (subtitles first, STT fallback), then summarize.
 
-## Setup
+## Before Running — MUST READ
 
-First run requires `--project-root`:
+### 1. Check projectRoot (CRITICAL)
 
+Read `init.json` first. If `projectRoot` is empty:
+- **ASK the user** where they want transcripts stored (e.g. `D:/video-summary`)
+- **NEVER invent a path yourself** — always confirm with the user
+- Pass the user's choice via `--project-root` on the first run; it will be saved for future use
+
+### 2. Environment (Windows)
+
+Set `PYTHONUTF8=1` before running to avoid GBK encoding errors:
 ```bash
-python video-summary.py "BV1fNw9ziEYk" --project-root "D:/video-summary"
+PYTHONUTF8=1 python video-summary.py ...
 ```
 
-After first run, `projectRoot` is saved to `init.json` and reused automatically.
+### 3. STT Model Download (First Time)
 
-Dependencies: `ffmpeg`, `ffprobe`, Python packages in `requirements.txt`. For STT: `faster-whisper`. For bilibili: `yutto`. For other platforms: `yt-dlp`.
+If subtitles are unavailable, the script falls back to Whisper STT. **The first STT run downloads a ~500 MB model**, which can take several minutes. This is normal — do NOT assume it failed or timed out. Use `--timeout 600000` (10 min) for the Bash call, or run it in the background. Once downloaded, the model is cached and subsequent runs are fast.
+
+## Dependencies
+
+- Required: `ffmpeg`, `ffprobe`
+- For bilibili: `yutto` (`pip install yutto`)
+- For other platforms: `yt-dlp`
+- For STT fallback: `faster-whisper` (`pip install faster-whisper`)
 
 ## Usage
 
 ```bash
-# Standard (subtitles first, STT fallback)
+# First run — must specify project root (ask the user!)
+python video-summary.py "BV1fNw9ziEYk" --project-root "D:/video-summary"
+
+# Subsequent runs — projectRoot is saved in init.json
 python video-summary.py "BV1fNw9ziEYk"
 
 # Force speech-to-text (skip subtitles)
 python video-summary.py "BV1fNw9ziEYk" --force-stt
 
-# Low-memory preset for constrained machines
+# Low-memory preset
 python video-summary.py "BV1fNw9ziEYk" --force-stt --low-memory
 
 # Other platforms
@@ -37,13 +55,21 @@ python video-summary.py "https://www.youtube.com/watch?v=xxx"
 python video-summary.py "path/to/audio.mp3" --force-stt
 ```
 
-Transcripts are cached by video ID in `{projectRoot}/transcripts/`. Repeated runs skip extraction. Use `--force-stt` to re-transcribe.
+Transcripts are cached by video ID in `{projectRoot}/transcripts/`. Repeated runs skip extraction.
+
+## Important Notes
+
+- **Many B站 videos have NO subtitles** — STT fallback is common, not exceptional. Be patient with the first STT run.
+- **Do NOT call B站 API directly** (e.g. `api.bilibili.com`) — it returns `412` due to anti-crawl. Always use `yutto` for bilibili content.
+- **Encoding**: The script handles UTF-8 internally. If you see `UnicodeEncodeError` from other commands (e.g. `pip show`), prefix with `PYTHONUTF8=1`.
+- **If the script exits with "projectRoot 未配置"**, you forgot to set it — ask the user and retry with `--project-root`.
 
 ## Summarization
 
-After getting the transcript output, summarize it:
+After getting the transcript output, summarize it in Chinese:
 
-- 一句话总结
-- 3-5 条关键要点
+- 一句话总结视频核心内容
+- 3-5 条关键要点（具体信息优先于笼统描述）
 - 如能识别阶段/话题变化，补充时间线或章节导航
-- 提炼具体信息、方法、结论和可执行建议
+- 提炼具体数据、方法、结论和可执行建议
+- 区分事实陈述与观点表达

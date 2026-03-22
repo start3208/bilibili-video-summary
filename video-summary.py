@@ -201,7 +201,12 @@ def load_whisper_model(cache_dir: Path, model_size: str):
     if hf:
         os.environ["HF_ENDPOINT"] = hf
     from faster_whisper import WhisperModel
-    eprint(f"[info] 加载 STT 模型 ({model_size})...")
+    # Check if model is already cached
+    model_dir = cache_dir / f"models--Systran--faster-whisper-{model_size}"
+    if model_dir.exists():
+        eprint(f"[info] 加载 STT 模型 ({model_size})...")
+    else:
+        eprint(f"[info] 首次使用，正在下载 STT 模型 ({model_size})，可能需要几分钟，请耐心等待...")
     try:
         return WhisperModel(model_size, device="cpu", compute_type="int8",
                             download_root=str(cache_dir))
@@ -271,7 +276,9 @@ def download_audio_generic(url: str, work_dir: Path) -> Path | None:
 # ── Main ────────────────────────────────────────────────────────────────
 
 def main():
-    os.environ.setdefault("PYTHONUTF8", "1")
+    # Force UTF-8 everywhere — prevents GBK errors on Windows
+    os.environ["PYTHONUTF8"] = "1"
+    os.environ["PYTHONIOENCODING"] = "utf-8"
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             try:
