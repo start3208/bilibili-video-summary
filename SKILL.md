@@ -4,42 +4,45 @@ description: Summarize videos by extracting subtitles or transcribing audio. Use
 ---
 # Video Summary
 
-Extract video transcript (subtitles first, STT fallback), then summarize.
+## What This Script Does (So You Don't Have To)
 
-## Before Running — MUST READ
+The script `video-summary.py` handles the **entire** extraction pipeline automatically:
+
+1. **Parse input** — accepts BV/av ID, bilibili URL, YouTube URL, or local file
+2. **Try subtitles first** — uses `yutto` (bilibili) or `yt-dlp` (other platforms)
+3. **Fall back to STT** — if no subtitles, downloads audio and transcribes with faster-whisper
+4. **Auto-select STT model** — checks available RAM, ranks models best→worst, tries loading each in order, falls back on OOM (large-v3 → turbo → medium → small → base → tiny)
+5. **Cache result** — saves transcript to `{projectRoot}/transcripts/bilibili-BVxxx-标题.txt`
+
+**Your only jobs are:**
+- Ensure `projectRoot` is set (ask user if empty)
+- Run the script with `PYTHONUTF8=1`
+- Wait for output (may take minutes on first STT run due to model download)
+- Summarize the transcript text it prints to stdout
+
+## DO NOT Do These Things
+
+- **DO NOT call B站 API directly** (e.g. `api.bilibili.com`) — returns `412` anti-crawl. Always use the script which uses `yutto`.
+- **DO NOT manually select or download STT models** — the script auto-detects RAM and handles fallback.
+- **DO NOT split/segment audio yourself** — faster-whisper streams in 30s windows internally, no segmentation needed.
+- **DO NOT assume the script failed if it runs for several minutes** — first-time STT requires model download (~1.5 GB). Use `--timeout 600000`.
+- **DO NOT invent a `projectRoot` path** — always ask the user.
+- **DO NOT install dependencies without asking** — the user may have a specific environment.
+
+## Before Running
 
 ### 1. Check projectRoot (CRITICAL)
 
 Read `init.json` first. If `projectRoot` is empty:
 - **ASK the user** where they want transcripts stored (e.g. `D:/video-summary`)
-- **NEVER invent a path yourself** — always confirm with the user
 - Pass the user's choice via `--project-root` on the first run; it will be saved for future use
 
 ### 2. Environment (Windows)
 
-Set `PYTHONUTF8=1` before running to avoid GBK encoding errors:
+Always prefix with `PYTHONUTF8=1` to avoid GBK encoding errors:
 ```bash
-PYTHONUTF8=1 python video-summary.py ...
+PYTHONUTF8=1 python video-summary.py "BV1xxx" --project-root "D:/video-summary"
 ```
-
-### 3. STT Model (Dynamic Selection with Fallback)
-
-If no `--stt-model` is specified and `sttModel` in `init.json` is empty, the script **checks available RAM at runtime** and builds a ranked candidate list from best to worst. It tries the top candidate first; if loading fails (OOM), it **automatically falls back** to the next smaller model. No manual intervention needed.
-
-faster-whisper streams audio in 30s windows internally — RAM usage is dominated by model weights, not audio length, so no segmentation is needed.
-
-| Model | Parameters | RAM (CPU int8) | Notes |
-|-------|-----------|----------------|-------|
-| `large-v3` | 1.55B | ~1.8 GB | Best quality, 32 decoder layers |
-| `turbo` | 809M | ~1.3 GB | large-v3-turbo, 4 decoder layers, ~8x faster |
-| `medium` | 769M | ~1.2 GB | Balanced |
-| `small` | 244M | ~0.6 GB | Lightweight |
-| `base` | 74M | ~0.4 GB | Minimal |
-| `tiny` | 39M | ~0.3 GB | Fastest, lowest quality |
-
-Override with `--stt-model <name>` to pin a specific model (disables fallback).
-
-**First STT run downloads the model** (up to ~1.5 GB for large-v3), which can take several minutes. This is normal — do NOT assume it failed or timed out. Use `--timeout 600000` (10 min) for the Bash call. Once downloaded, subsequent runs are fast.
 
 ## Dependencies
 
@@ -52,32 +55,38 @@ Override with `--stt-model <name>` to pin a specific model (disables fallback).
 
 ```bash
 # First run — must specify project root (ask the user!)
-python video-summary.py "BV1fNw9ziEYk" --project-root "D:/video-summary"
+PYTHONUTF8=1 python video-summary.py "BV1fNw9ziEYk" --project-root "D:/video-summary"
 
 # Subsequent runs — projectRoot is saved in init.json
-python video-summary.py "BV1fNw9ziEYk"
+PYTHONUTF8=1 python video-summary.py "BV1fNw9ziEYk"
 
 # Force speech-to-text (skip subtitles)
-python video-summary.py "BV1fNw9ziEYk" --force-stt
+PYTHONUTF8=1 python video-summary.py "BV1fNw9ziEYk" --force-stt
 
-# Pin a specific model
-python video-summary.py "BV1fNw9ziEYk" --force-stt --stt-model medium
+# Pin a specific model (disables auto-fallback)
+PYTHONUTF8=1 python video-summary.py "BV1fNw9ziEYk" --force-stt --stt-model medium
 
 # Other platforms
-python video-summary.py "https://www.youtube.com/watch?v=xxx"
+PYTHONUTF8=1 python video-summary.py "https://www.youtube.com/watch?v=xxx"
 
 # Local audio file
-python video-summary.py "path/to/audio.mp3" --force-stt
+PYTHONUTF8=1 python video-summary.py "path/to/audio.mp3" --force-stt
 ```
 
-Transcripts are cached by video ID and title in `{projectRoot}/transcripts/`, e.g. `bilibili-BV1xxx-视频标题.txt`. Repeated runs skip extraction.
+Transcripts are cached. Repeated runs for the same video skip extraction and return instantly.
 
-## Important Notes
+## STT Model Reference
 
-- **Many B站 videos have NO subtitles** — STT fallback is common, not exceptional. Be patient with the first STT run.
-- **Do NOT call B站 API directly** (e.g. `api.bilibili.com`) — it returns `412` due to anti-crawl. Always use `yutto` for bilibili content.
-- **Encoding**: The script handles UTF-8 internally. If you see `UnicodeEncodeError` from other commands (e.g. `pip show`), prefix with `PYTHONUTF8=1`.
-- **If the script exits with "projectRoot 未配置"**, you forgot to set it — ask the user and retry with `--project-root`.
+Auto-selected by available RAM. The script handles this — you do not need to choose.
+
+| Model | Parameters | RAM (CPU int8) | Notes |
+|-------|-----------|----------------|-------|
+| `large-v3` | 1.55B | ~1.8 GB | Best quality, 32 decoder layers |
+| `turbo` | 809M | ~1.3 GB | large-v3-turbo, 4 decoder layers, ~8x faster |
+| `medium` | 769M | ~1.2 GB | Balanced |
+| `small` | 244M | ~0.6 GB | Lightweight |
+| `base` | 74M | ~0.4 GB | Minimal |
+| `tiny` | 39M | ~0.3 GB | Fastest, lowest quality |
 
 ## Summarization
 
