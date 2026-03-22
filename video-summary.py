@@ -17,10 +17,18 @@ CONFIG_PATH = SKILL_DIR / "init.json"
 AUDIO_EXTS = {".m4a", ".mp3", ".wav", ".flac", ".aac", ".ogg", ".mp4", ".mkv", ".mov"}
 DEBUG = False
 
-# Model size → approximate RAM requirement (GB)
-MODEL_RAM_GB = {
-    "tiny": 1, "base": 1, "small": 2, "medium": 5,
-    "large-v3": 10, "turbo": 6,
+# Whisper model specs for auto-selection.
+# Parameters from OpenAI; RAM figures are for faster-whisper CPU int8 inference
+# (roughly 40-50% of the official GPU float16 VRAM requirements).
+# Sources: https://github.com/openai/whisper, https://github.com/SYSTRAN/faster-whisper
+MODEL_SPECS = {
+    #                 params    RAM (GB, CPU int8)
+    "tiny":          (39_000_000,   0.5),
+    "base":          (74_000_000,   0.5),
+    "small":        (244_000_000,   1.0),
+    "medium":       (769_000_000,   2.5),
+    "turbo":        (809_000_000,   3.0),   # large-v3-turbo, 4 decoder layers
+    "large-v3":   (1_550_000_000,   5.0),   # 32 decoder layers
 }
 
 
@@ -122,7 +130,7 @@ def auto_select_model() -> str:
     avail = get_available_ram_gb() - 2.0  # reserve headroom
     # Try from best to worst
     for model in ("large-v3", "turbo", "medium", "small", "base", "tiny"):
-        if MODEL_RAM_GB[model] <= avail:
+        if MODEL_SPECS[model][1] <= avail:
             return model
     return "tiny"
 
@@ -388,7 +396,7 @@ def main():
     p.add_argument("input", help="BV/av ID, URL, or local file path")
     p.add_argument("--force-stt", action="store_true", help="Skip subtitles, transcribe from audio")
     p.add_argument("--project-root", help="Root dir for transcripts and cache")
-    p.add_argument("--stt-model", help="Whisper model (tiny/base/small/medium/large-v3/turbo)")
+    p.add_argument("--stt-model", help="Whisper model: tiny(39M)/base(74M)/small(244M)/medium(769M)/turbo(809M)/large-v3(1.55B)")
     p.add_argument("--low-memory", action="store_true", help="Conservative STT settings")
     p.add_argument("--beam-size", type=int, default=5)
     p.add_argument("--no-vad", action="store_true")

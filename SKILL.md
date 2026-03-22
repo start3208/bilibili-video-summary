@@ -24,11 +24,16 @@ PYTHONUTF8=1 python video-summary.py ...
 
 ### 3. STT Model (Auto-Selected)
 
-If `sttModel` in `init.json` is empty, the script **auto-detects available RAM** and picks the best model that fits:
-- `large-v3` (~10 GB) — best quality
-- `turbo` (~6 GB) — fast and good
-- `medium` (~5 GB) — balanced
-- `small` (~2 GB) / `base` (~1 GB) / `tiny` (~1 GB) — lightweight
+If `sttModel` in `init.json` is empty, the script **auto-detects available RAM** and picks the best model that fits (faster-whisper, CPU, int8 quantization):
+
+| Model | Parameters | RAM (CPU int8) | Notes |
+|-------|-----------|----------------|-------|
+| `large-v3` | 1.55B | ~5 GB | Best quality, 32 decoder layers |
+| `turbo` | 809M | ~3 GB | large-v3-turbo, 4 decoder layers, ~8x faster than large |
+| `medium` | 769M | ~2.5 GB | Balanced |
+| `small` | 244M | ~1 GB | Lightweight |
+| `base` | 74M | ~0.5 GB | Minimal |
+| `tiny` | 39M | ~0.5 GB | Fastest, lowest quality |
 
 The selected model is saved to `init.json` for future runs. Override with `--stt-model <name>`.
 
