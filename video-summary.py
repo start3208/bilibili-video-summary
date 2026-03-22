@@ -19,23 +19,20 @@ DEBUG = False
 
 # Whisper model specs for auto-selection (faster-whisper, CPU, int8 quantization).
 # - params: from OpenAI official table
-# - load_ram: model weights in int8 + CTranslate2 runtime overhead (~0.3 GB)
-# - peak_ram: observed peak during long audio (~13 min) without segmentation
-# With --segment-seconds, peak stays close to load_ram.
+# - load_ram: model weights in int8 + CTranslate2 runtime overhead
+#   faster-whisper streams audio in 30s windows internally, so RAM usage
+#   is dominated by model weights, not audio length.
 # Sources: https://github.com/openai/whisper
 #          https://github.com/SYSTRAN/faster-whisper (benchmarks)
 MODEL_SPECS = {
-    #                params        load_ram  peak_ram (GB, CPU int8)
-    "tiny":       {"params":  39_000_000, "load": 0.3, "peak": 0.4},
-    "base":       {"params":  74_000_000, "load": 0.4, "peak": 0.5},
-    "small":      {"params": 244_000_000, "load": 0.6, "peak": 0.8},
-    "medium":     {"params": 769_000_000, "load": 1.2, "peak": 1.6},
-    "turbo":      {"params": 809_000_000, "load": 1.3, "peak": 1.7},  # large-v3-turbo, 4 decoder layers
-    "large-v3":   {"params":1_550_000_000,"load": 1.8, "peak": 2.3},  # 32 decoder layers
+    #                params        load_ram (GB, CPU int8)
+    "tiny":       {"params":  39_000_000, "load": 0.3},
+    "base":       {"params":  74_000_000, "load": 0.4},
+    "small":      {"params": 244_000_000, "load": 0.6},
+    "medium":     {"params": 769_000_000, "load": 1.2},
+    "turbo":      {"params": 809_000_000, "load": 1.3},   # large-v3-turbo, 4 decoder layers
+    "large-v3":   {"params":1_550_000_000,"load": 1.8},   # 32 decoder layers
 }
-
-# Auto-segmentation threshold: if available RAM < peak but >= load, split audio
-AUTO_SEGMENT_SEC = 120  # 2-minute chunks keep peak RAM close to load_ram
 
 
 # ── Config ──────────────────────────────────────────────────────────────
@@ -130,24 +127,19 @@ def get_available_ram_gb() -> float:
     return 4.0  # conservative fallback
 
 
-def rank_models(avail_gb: float) -> list[tuple[str, int]]:
+def rank_models(avail_gb: float) -> list[str]:
     """Rank models from best to worst that could fit in available RAM.
 
-    Returns list of (model_name, segment_seconds).
-    Each entry is a candidate: try the first, fall back to the next on failure.
+    Returns list of model names. Tries the first, falls back on load failure.
     Reserves 1 GB headroom for OS/other processes.
     """
     budget = avail_gb - 1.0
     candidates = []
     for name in ("large-v3", "turbo", "medium", "small", "base", "tiny"):
-        spec = MODEL_SPECS[name]
-        if budget >= spec["peak"]:
-            candidates.append((name, 0))
-        elif budget >= spec["load"] + 0.2:
-            candidates.append((name, AUTO_SEGMENT_SEC))
-    # Always include tiny as ultimate fallback
-    if not candidates or candidates[-1][0] != "tiny":
-        candidates.append(("tiny", AUTO_SEGMENT_SEC))
+        if budget >= MODEL_SPECS[name]["load"]:
+            candidates.append(name)
+    if not candidates or candidates[-1] != "tiny":
+        candidates.append("tiny")
     return candidates
 
 
@@ -306,20 +298,10 @@ def extract_subtitles_generic(url: str, lang: str, work_dir: Path) -> str:
 
 # ── STT ─────────────────────────────────────────────────────────────────
 
-def ffprobe_duration(path: str) -> float:
-    try:
-        out = run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                    "-of", "default=noprint_wrappers=1:nokey=1", path],
-                  check=False).stdout.strip()
-        return float(out or 0)
-    except Exception:
-        return 0.0
-
-
-def load_whisper_model(cache_dir: Path, candidates: list[tuple[str, int]]):
+def load_whisper_model(cache_dir: Path, candidates: list[str]):
     """Try loading models from candidates list, falling back on failure.
 
-    Returns (model, model_name, segment_seconds).
+    Returns (model, model_name).
     """
     os.environ.setdefault("HF_HOME", str(cache_dir))
     os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(cache_dir))
@@ -329,7 +311,7 @@ def load_whisper_model(cache_dir: Path, candidates: list[tuple[str, int]]):
     from faster_whisper import WhisperModel
 
     last_err = None
-    for i, (name, seg_sec) in enumerate(candidates):
+    for i, name in enumerate(candidates):
         model_dir = cache_dir / f"models--Systran--faster-whisper-{name}"
         if model_dir.exists():
             eprint(f"[info] 加载 STT 模型 ({name})...")
@@ -340,50 +322,34 @@ def load_whisper_model(cache_dir: Path, candidates: list[tuple[str, int]]):
                                  download_root=str(cache_dir))
             if i > 0:
                 eprint(f"[info] 回退到 {name} 成功")
-            return model, name, seg_sec
+            return model, name
         except (MemoryError, OSError, RuntimeError) as e:
             last_err = e
             remaining = len(candidates) - i - 1
             if remaining > 0:
-                next_name = candidates[i + 1][0]
-                eprint(f"[warn] {name} 加载失败 ({type(e).__name__})，回退到 {next_name}...")
+                eprint(f"[warn] {name} 加载失败 ({type(e).__name__})，回退到 {candidates[i + 1]}...")
             else:
                 eprint(f"[error] {name} 加载失败: {e}")
         except Exception as e:
-            # Non-memory errors (e.g. network) — don't fallback, just fail
             raise SystemExit(f"STT 模型加载失败: {e}")
 
     raise SystemExit(f"所有模型均加载失败，最后错误: {last_err}")
 
 
-def transcribe(audio_path: Path, cache_dir: Path, candidates: list[tuple[str, int]],
-               language: str, vad: bool, beam: int, seg_sec_override: int) -> str:
-    model, model_name, auto_seg = load_whisper_model(cache_dir, candidates)
-    # Use explicit override if set, otherwise use auto-segmentation from model selection
-    seg_sec = seg_sec_override if seg_sec_override > 0 else auto_seg
-    to_process = [audio_path]
-    if seg_sec > 0 and ffprobe_duration(str(audio_path)) > seg_sec:
-        seg_dir = audio_path.parent / "segments"
-        seg_dir.mkdir(exist_ok=True)
-        run(["ffmpeg", "-y", "-i", str(audio_path), "-f", "segment",
-             "-segment_time", str(seg_sec), "-c:a", "pcm_s16le",
-             "-ar", "16000", "-ac", "1", str(seg_dir / "seg-%03d.wav")])
-        chunks = sorted(seg_dir.glob("seg-*.wav"))
-        if chunks:
-            to_process = chunks
-
+def transcribe(audio_path: Path, cache_dir: Path, candidates: list[str],
+               language: str, vad: bool, beam: int) -> str:
+    model, model_name = load_whisper_model(cache_dir, candidates)
     parts = []
-    eprint("[info] 执行 STT 转录...")
-    for sp in to_process:
-        try:
-            segs, _ = model.transcribe(str(sp), language=language,
-                                       vad_filter=vad, beam_size=beam)
-            for s in segs:
-                t = s.text.strip()
-                if t:
-                    parts.append(t)
-        except Exception as e:
-            eprint(f"[warn] 转录失败: {sp.name} - {e}")
+    eprint(f"[info] 使用 {model_name} 执行 STT 转录...")
+    try:
+        segs, _ = model.transcribe(str(audio_path), language=language,
+                                   vad_filter=vad, beam_size=beam)
+        for s in segs:
+            t = s.text.strip()
+            if t:
+                parts.append(t)
+    except Exception as e:
+        eprint(f"[warn] 转录失败: {audio_path.name} - {e}")
     return "\n".join(parts)
 
 
@@ -435,10 +401,7 @@ def main():
     p.add_argument("--force-stt", action="store_true", help="Skip subtitles, transcribe from audio")
     p.add_argument("--project-root", help="Root dir for transcripts and cache")
     p.add_argument("--stt-model", help="Whisper model: tiny(39M)/base(74M)/small(244M)/medium(769M)/turbo(809M)/large-v3(1.55B)")
-    p.add_argument("--low-memory", action="store_true", help="Conservative STT settings")
     p.add_argument("--beam-size", type=int, default=5)
-    p.add_argument("--no-vad", action="store_true")
-    p.add_argument("--segment-seconds", type=int, default=0)
     p.add_argument("--stt-language", default="zh")
     p.add_argument("--keep-audio", action="store_true")
     p.add_argument("--debug", action="store_true")
@@ -462,15 +425,12 @@ def main():
     # Build model candidate list
     if stt_model:
         # User/config specified a model — use it directly (no fallback)
-        model_candidates = [(stt_model, args.segment_seconds)]
+        model_candidates = [stt_model]
     else:
-        # Auto-select based on current available RAM
+        # Auto-select based on current available RAM, with fallback chain
         avail = get_available_ram_gb()
         model_candidates = rank_models(avail)
-        top, seg = model_candidates[0]
-        seg_info = f"，自动分段 {seg}s" if seg else ""
-        eprint(f"[info] 可用内存 {avail:.1f} GB → 首选 {top}{seg_info}"
-               f" (共 {len(model_candidates)} 个候选)")
+        eprint(f"[info] 可用内存 {avail:.1f} GB → 候选模型: {' > '.join(model_candidates)}")
 
     # Persist config on explicit --project-root
     if args.project_root:
@@ -478,12 +438,6 @@ def main():
         if args.stt_model:
             cfg["sttModel"] = args.stt_model
         save_config(cfg)
-
-    # Low-memory preset: override candidates to conservative settings
-    if args.low_memory:
-        low_model = args.stt_model or "base"
-        model_candidates = [(low_model, 180)]
-        args.beam_size = 1
 
     dirs = ensure_dirs(project_root)
     require_cmds("ffmpeg", "ffprobe")
@@ -539,8 +493,7 @@ def main():
             eprint("[info] 字幕不可用，转入 STT...")
         if platform == "local":
             transcript = transcribe(Path(raw), dirs["cache"], model_candidates,
-                                    args.stt_language, not args.no_vad,
-                                    args.beam_size, args.segment_seconds)
+                                    args.stt_language, True, args.beam_size)
         else:
             with tempfile.TemporaryDirectory(prefix="vs-audio-") as td:
                 audio = (download_audio_bilibili(url, Path(td)) if platform == "bilibili"
@@ -548,8 +501,7 @@ def main():
                 if not audio or not audio.exists():
                     raise SystemExit("无法获取音频文件")
                 transcript = transcribe(audio, dirs["cache"], model_candidates,
-                                        args.stt_language, not args.no_vad,
-                                        args.beam_size, args.segment_seconds)
+                                        args.stt_language, True, args.beam_size)
                 if args.keep_audio:
                     dst = dirs["temp"] / key
                     dst.mkdir(parents=True, exist_ok=True)

@@ -26,24 +26,16 @@ PYTHONUTF8=1 python video-summary.py ...
 
 If no `--stt-model` is specified and `sttModel` in `init.json` is empty, the script **checks available RAM at runtime** and builds a ranked candidate list from best to worst. It tries the top candidate first; if loading fails (OOM), it **automatically falls back** to the next smaller model. No manual intervention needed.
 
-- When available RAM comfortably exceeds a model's peak usage → use it directly
-- When RAM is tight (enough to load but not for long audio) → auto-segment (2-min chunks) to cap peak
-- On MemoryError / load failure → silently retry with the next candidate
+faster-whisper streams audio in 30s windows internally — RAM usage is dominated by model weights, not audio length, so no segmentation is needed.
 
-faster-whisper, CPU, int8 quantization:
-
-| Model | Parameters | Load RAM | Peak RAM (long audio) | Notes |
-|-------|-----------|----------|----------------------|-------|
-| `large-v3` | 1.55B | ~1.8 GB | ~2.3 GB | Best quality, 32 decoder layers |
-| `turbo` | 809M | ~1.3 GB | ~1.7 GB | large-v3-turbo, 4 decoder layers, ~8x faster |
-| `medium` | 769M | ~1.2 GB | ~1.6 GB | Balanced |
-| `small` | 244M | ~0.6 GB | ~0.8 GB | Lightweight |
-| `base` | 74M | ~0.4 GB | ~0.5 GB | Minimal |
-| `tiny` | 39M | ~0.3 GB | ~0.4 GB | Fastest, lowest quality |
-
-- **Load RAM**: model weights (int8) + runtime overhead, always occupied
-- **Peak RAM**: maximum during inference on long audio (~13 min) without segmentation
-- **With segmentation**: peak stays close to Load RAM
+| Model | Parameters | RAM (CPU int8) | Notes |
+|-------|-----------|----------------|-------|
+| `large-v3` | 1.55B | ~1.8 GB | Best quality, 32 decoder layers |
+| `turbo` | 809M | ~1.3 GB | large-v3-turbo, 4 decoder layers, ~8x faster |
+| `medium` | 769M | ~1.2 GB | Balanced |
+| `small` | 244M | ~0.6 GB | Lightweight |
+| `base` | 74M | ~0.4 GB | Minimal |
+| `tiny` | 39M | ~0.3 GB | Fastest, lowest quality |
 
 Override with `--stt-model <name>` to pin a specific model (disables fallback).
 
@@ -68,8 +60,8 @@ python video-summary.py "BV1fNw9ziEYk"
 # Force speech-to-text (skip subtitles)
 python video-summary.py "BV1fNw9ziEYk" --force-stt
 
-# Low-memory preset
-python video-summary.py "BV1fNw9ziEYk" --force-stt --low-memory
+# Pin a specific model
+python video-summary.py "BV1fNw9ziEYk" --force-stt --stt-model medium
 
 # Other platforms
 python video-summary.py "https://www.youtube.com/watch?v=xxx"
