@@ -338,8 +338,8 @@ def main():
     project_root = args.project_root or cfg["projectRoot"]
     if not project_root:
         raise SystemExit(
-            "projectRoot 未配置。请用 --project-root 指定，例如:\n"
-            f'  python "{Path(__file__).name}" "BV1xxx" --project-root "D:/video-summary"'
+            "[ACTION_REQUIRED] projectRoot 未配置。"
+            "请询问用户希望将转录文本保存到哪个目录，然后用 --project-root <路径> 重新运行。"
         )
     project_root = Path(project_root)
     stt_model = args.stt_model or cfg["sttModel"] or DEFAULT_STT_MODEL
