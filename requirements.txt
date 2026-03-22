@@ -1,0 +1,6 @@
+# Python dependencies for bilibili-video-summary
+# System dependency note: ffmpeg / ffprobe must be installed separately.
+# yutto can be installed from PyPI (`pip install yutto`) or from the checked-out repo.
+
+faster-whisper>=1.2.1
+yutto>=2.1.1
