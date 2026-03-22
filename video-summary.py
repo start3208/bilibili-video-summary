@@ -17,22 +17,13 @@ CONFIG_PATH = SKILL_DIR / "init.json"
 AUDIO_EXTS = {".m4a", ".mp3", ".wav", ".flac", ".aac", ".ogg", ".mp4", ".mkv", ".mov"}
 DEBUG = False
 
-# Whisper model specs for auto-selection (faster-whisper, CPU, int8 quantization).
-# - params: from OpenAI official table
-# - load_ram: model weights in int8 + CTranslate2 runtime overhead
-#   faster-whisper streams audio in 30s windows internally, so RAM usage
-#   is dominated by model weights, not audio length.
+# Whisper model specs (faster-whisper, CPU, int8 quantization).
 # Sources: https://github.com/openai/whisper
-#          https://github.com/SYSTRAN/faster-whisper (benchmarks)
-MODEL_SPECS = {
-    #                params        load_ram (GB, CPU int8)
-    "tiny":       {"params":  39_000_000, "load": 0.3},
-    "base":       {"params":  74_000_000, "load": 0.4},
-    "small":      {"params": 244_000_000, "load": 0.6},
-    "medium":     {"params": 769_000_000, "load": 1.2},
-    "turbo":      {"params": 809_000_000, "load": 1.3},   # large-v3-turbo, 4 decoder layers
-    "large-v3":   {"params":1_550_000_000,"load": 1.8},   # 32 decoder layers
-}
+#          https://github.com/SYSTRAN/faster-whisper
+# Default is "small" — good balance of speed and quality on average hardware.
+# Larger models (medium, turbo, large-v3) are much slower on CPU and should
+# only be used when the user explicitly requests better quality.
+DEFAULT_STT_MODEL = "small"
 
 
 # ── Config ──────────────────────────────────────────────────────────────
@@ -89,58 +80,6 @@ def require_cmds(*names: str):
     missing = [n for n in names if not shutil.which(n)]
     if missing:
         raise SystemExit(f"缺少依赖: {', '.join(missing)}")
-
-
-def get_available_ram_gb() -> float:
-    """Return currently available physical RAM in GB."""
-    try:
-        import psutil
-        return psutil.virtual_memory().available / (1024 ** 3)
-    except ImportError:
-        pass
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            class MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [("dwLength", ctypes.c_ulong),
-                            ("dwMemoryLoad", ctypes.c_ulong),
-                            ("ullTotalPhys", ctypes.c_ulonglong),
-                            ("ullAvailPhys", ctypes.c_ulonglong),
-                            ("ullTotalPageFile", ctypes.c_ulonglong),
-                            ("ullAvailPageFile", ctypes.c_ulonglong),
-                            ("ullTotalVirtual", ctypes.c_ulonglong),
-                            ("ullAvailVirtual", ctypes.c_ulonglong),
-                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-            stat = MEMORYSTATUSEX(dwLength=ctypes.sizeof(MEMORYSTATUSEX))
-            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
-            return stat.ullAvailPhys / (1024 ** 3)
-        except Exception:
-            pass
-    else:
-        try:
-            with open("/proc/meminfo") as f:
-                for line in f:
-                    if line.startswith("MemAvailable:"):
-                        return int(line.split()[1]) / (1024 ** 2)
-        except Exception:
-            pass
-    return 4.0  # conservative fallback
-
-
-def rank_models(avail_gb: float) -> list[str]:
-    """Rank models from best to worst that could fit in available RAM.
-
-    Returns list of model names. Tries the first, falls back on load failure.
-    Reserves 1 GB headroom for OS/other processes.
-    """
-    budget = avail_gb - 1.0
-    candidates = []
-    for name in ("large-v3", "turbo", "medium", "small", "base", "tiny"):
-        if budget >= MODEL_SPECS[name]["load"]:
-            candidates.append(name)
-    if not candidates or candidates[-1] != "tiny":
-        candidates.append("tiny")
-    return candidates
 
 
 def sanitize_filename(s: str, max_len: int = 80) -> str:
@@ -298,11 +237,8 @@ def extract_subtitles_generic(url: str, lang: str, work_dir: Path) -> str:
 
 # ── STT ─────────────────────────────────────────────────────────────────
 
-def load_whisper_model(cache_dir: Path, candidates: list[str]):
-    """Try loading models from candidates list, falling back on failure.
-
-    Returns (model, model_name).
-    """
+def load_whisper_model(cache_dir: Path, model_name: str):
+    """Load a faster-whisper model. Returns the model instance."""
     os.environ.setdefault("HF_HOME", str(cache_dir))
     os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(cache_dir))
     hf = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
@@ -310,40 +246,26 @@ def load_whisper_model(cache_dir: Path, candidates: list[str]):
         os.environ["HF_ENDPOINT"] = hf
     from faster_whisper import WhisperModel
 
-    last_err = None
-    for i, name in enumerate(candidates):
-        model_dir = cache_dir / f"models--Systran--faster-whisper-{name}"
-        if model_dir.exists():
-            eprint(f"[info] 加载 STT 模型 ({name})...")
-        else:
-            eprint(f"[info] 首次使用，正在下载 STT 模型 ({name})，可能需要几分钟，请耐心等待...")
-        try:
-            model = WhisperModel(name, device="cpu", compute_type="int8",
-                                 download_root=str(cache_dir))
-            if i > 0:
-                eprint(f"[info] 回退到 {name} 成功")
-            return model, name
-        except (MemoryError, OSError, RuntimeError) as e:
-            last_err = e
-            remaining = len(candidates) - i - 1
-            if remaining > 0:
-                eprint(f"[warn] {name} 加载失败 ({type(e).__name__})，回退到 {candidates[i + 1]}...")
-            else:
-                eprint(f"[error] {name} 加载失败: {e}")
-        except Exception as e:
-            raise SystemExit(f"STT 模型加载失败: {e}")
-
-    raise SystemExit(f"所有模型均加载失败，最后错误: {last_err}")
+    model_dir = cache_dir / f"models--Systran--faster-whisper-{model_name}"
+    if model_dir.exists():
+        eprint(f"[info] 加载 STT 模型 ({model_name})...")
+    else:
+        eprint(f"[info] 首次使用，正在下载 STT 模型 ({model_name})，可能需要几分钟，请耐心等待...")
+    try:
+        return WhisperModel(model_name, device="cpu", compute_type="int8",
+                            download_root=str(cache_dir))
+    except Exception as e:
+        raise SystemExit(f"STT 模型加载失败: {e}")
 
 
-def transcribe(audio_path: Path, cache_dir: Path, candidates: list[str],
-               language: str, vad: bool, beam: int) -> str:
-    model, model_name = load_whisper_model(cache_dir, candidates)
+def transcribe(audio_path: Path, cache_dir: Path, model_name: str,
+               language: str, beam: int) -> str:
+    model = load_whisper_model(cache_dir, model_name)
     parts = []
     eprint(f"[info] 使用 {model_name} 执行 STT 转录...")
     try:
         segs, _ = model.transcribe(str(audio_path), language=language,
-                                   vad_filter=vad, beam_size=beam)
+                                   vad_filter=True, beam_size=beam)
         for s in segs:
             t = s.text.strip()
             if t:
@@ -420,20 +342,10 @@ def main():
             f'  python "{Path(__file__).name}" "BV1xxx" --project-root "D:/video-summary"'
         )
     project_root = Path(project_root)
-    stt_model = args.stt_model or cfg["sttModel"] or ""
+    stt_model = args.stt_model or cfg["sttModel"] or DEFAULT_STT_MODEL
 
-    # Build model candidate list
-    if stt_model:
-        # User/config specified a model — use it directly (no fallback)
-        model_candidates = [stt_model]
-    else:
-        # Auto-select based on current available RAM, with fallback chain
-        avail = get_available_ram_gb()
-        model_candidates = rank_models(avail)
-        eprint(f"[info] 可用内存 {avail:.1f} GB → 候选模型: {' > '.join(model_candidates)}")
-
-    # Persist config on explicit --project-root
-    if args.project_root:
+    # Persist config on explicit --project-root or --stt-model
+    if args.project_root or args.stt_model:
         cfg["projectRoot"] = str(project_root)
         if args.stt_model:
             cfg["sttModel"] = args.stt_model
@@ -492,16 +404,16 @@ def main():
         if not args.force_stt:
             eprint("[info] 字幕不可用，转入 STT...")
         if platform == "local":
-            transcript = transcribe(Path(raw), dirs["cache"], model_candidates,
-                                    args.stt_language, True, args.beam_size)
+            transcript = transcribe(Path(raw), dirs["cache"], stt_model,
+                                    args.stt_language, args.beam_size)
         else:
             with tempfile.TemporaryDirectory(prefix="vs-audio-") as td:
                 audio = (download_audio_bilibili(url, Path(td)) if platform == "bilibili"
                          else download_audio_generic(url, Path(td)))
                 if not audio or not audio.exists():
                     raise SystemExit("无法获取音频文件")
-                transcript = transcribe(audio, dirs["cache"], model_candidates,
-                                        args.stt_language, True, args.beam_size)
+                transcript = transcribe(audio, dirs["cache"], stt_model,
+                                        args.stt_language, args.beam_size)
                 if args.keep_audio:
                     dst = dirs["temp"] / key
                     dst.mkdir(parents=True, exist_ok=True)
