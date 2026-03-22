@@ -24,7 +24,16 @@ PYTHONUTF8=1 python video-summary.py ...
 
 ### 3. STT Model (Auto-Selected)
 
-If `sttModel` in `init.json` is empty, the script **auto-detects available RAM** and picks the best model that fits. When RAM is enough to load the model but tight for long audio, it **automatically enables segmented transcription** (2-min chunks) to keep peak memory low.
+If `sttModel` in `init.json` is empty, the script **detects total physical RAM** (not available — stable and repeatable) and picks the best model, reserving ~4 GB for OS and typical apps. When RAM budget is enough to load but tight for long audio, it **auto-segments** (2-min chunks) to cap peak memory.
+
+Example outcomes:
+
+| Total RAM | Model Selected | Segmentation |
+|-----------|---------------|-------------|
+| 4 GB | tiny | yes (120s) |
+| 5 GB | small | no |
+| 6 GB | turbo (809M) | no |
+| 7 GB+ | large-v3 (1.55B) | no |
 
 faster-whisper, CPU, int8 quantization:
 
@@ -39,7 +48,7 @@ faster-whisper, CPU, int8 quantization:
 
 - **Load RAM**: model weights (int8) + runtime overhead, always occupied
 - **Peak RAM**: maximum during inference on long audio (~13 min) without segmentation
-- **With segmentation**: peak stays close to Load RAM — so even a 4 GB machine can run `large-v3`
+- **With segmentation**: peak stays close to Load RAM — so even a 7 GB machine can run `large-v3`
 
 The selected model is saved to `init.json` for future runs. Override with `--stt-model <name>`.
 

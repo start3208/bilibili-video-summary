@@ -94,14 +94,13 @@ def require_cmds(*names: str):
         raise SystemExit(f"缺少依赖: {', '.join(missing)}")
 
 
-def get_available_ram_gb() -> float:
-    """Return available RAM in GB."""
+def get_total_ram_gb() -> float:
+    """Return total physical RAM in GB (stable, unlike available RAM)."""
     try:
         import psutil
-        return psutil.virtual_memory().available / (1024 ** 3)
+        return psutil.virtual_memory().total / (1024 ** 3)
     except ImportError:
         pass
-    # Fallback: read from OS
     if sys.platform == "win32":
         try:
             import ctypes
@@ -117,37 +116,39 @@ def get_available_ram_gb() -> float:
                             ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
             stat = MEMORYSTATUSEX(dwLength=ctypes.sizeof(MEMORYSTATUSEX))
             ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
-            return stat.ullAvailPhys / (1024 ** 3)
+            return stat.ullTotalPhys / (1024 ** 3)
         except Exception:
             pass
     else:
         try:
             with open("/proc/meminfo") as f:
                 for line in f:
-                    if line.startswith("MemAvailable:"):
+                    if line.startswith("MemTotal:"):
                         return int(line.split()[1]) / (1024 ** 2)
         except Exception:
             pass
-    return 4.0  # conservative fallback
+    return 8.0  # conservative fallback
 
 
-def auto_select_model(avail_gb: float) -> tuple[str, int]:
-    """Pick the best Whisper model for available RAM.
+def auto_select_model(total_ram_gb: float) -> tuple[str, int]:
+    """Pick the best Whisper model based on total physical RAM.
+
+    Uses total RAM (not available) for a stable, repeatable decision.
+    Reserves ~4 GB for OS + typical apps (browser, IDE, etc.).
 
     Returns (model_name, segment_seconds).
-    - If RAM >= peak: no segmentation needed (segment_seconds=0)
-    - If load <= RAM < peak: use model with auto-segmentation to cap peak
+    - If budget >= peak: no segmentation needed (segment_seconds=0)
+    - If load <= budget < peak: use model with auto-segmentation to cap peak
     - Otherwise: try a smaller model
     """
-    headroom = 1.0  # GB reserved for OS and other processes
-    usable = avail_gb - headroom
+    budget = total_ram_gb - 4.0  # reserve for OS + typical workload
 
     # Try from best to worst
     for name in ("large-v3", "turbo", "medium", "small", "base", "tiny"):
         spec = MODEL_SPECS[name]
-        if usable >= spec["peak"]:
+        if budget >= spec["peak"]:
             return name, 0  # plenty of RAM, no segmentation
-        if usable >= spec["load"] + 0.3:
+        if budget >= spec["load"] + 0.3:
             # Can load the model, but need segmentation to stay under peak
             return name, AUTO_SEGMENT_SEC
     return "tiny", AUTO_SEGMENT_SEC
@@ -441,10 +442,10 @@ def main():
 
     # Auto-select model if not configured
     if not stt_model:
-        avail = get_available_ram_gb()
-        stt_model, auto_seg = auto_select_model(avail)
+        total = get_total_ram_gb()
+        stt_model, auto_seg = auto_select_model(total)
         seg_info = f"，自动分段 {auto_seg}s" if auto_seg else ""
-        eprint(f"[info] 可用内存 {avail:.1f} GB → 自动选择 STT 模型: {stt_model}{seg_info}")
+        eprint(f"[info] 总内存 {total:.0f} GB → 自动选择 STT 模型: {stt_model}{seg_info}")
         # Apply auto-segmentation if user didn't specify
         if auto_seg and not args.segment_seconds:
             args.segment_seconds = auto_seg
