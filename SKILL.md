@@ -3,7 +3,7 @@ name: bilibili-video-summary
 description: Summarize videos by extracting subtitles or transcribing audio. Use when a user provides a BV/av ID, Bilibili URL, or other video platform URL and wants a summary, transcript, or subtitle extraction.
 ---
 
-**直接运行，不需要预检查。** 脚本会自动处理字幕提取、STT 回退、模型加载、结果缓存。
+**直接运行，不需要预检查。** 脚本自动提取字幕（无字幕则转语音识别）、加载模型、缓存结果。
 
 ```bash
 PYTHONUTF8=1 python video-summary.py "<BV号或URL>"
