@@ -94,11 +94,11 @@ def require_cmds(*names: str):
         raise SystemExit(f"缺少依赖: {', '.join(missing)}")
 
 
-def get_total_ram_gb() -> float:
-    """Return total physical RAM in GB (stable, unlike available RAM)."""
+def get_available_ram_gb() -> float:
+    """Return currently available physical RAM in GB."""
     try:
         import psutil
-        return psutil.virtual_memory().total / (1024 ** 3)
+        return psutil.virtual_memory().available / (1024 ** 3)
     except ImportError:
         pass
     if sys.platform == "win32":
@@ -116,42 +116,39 @@ def get_total_ram_gb() -> float:
                             ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
             stat = MEMORYSTATUSEX(dwLength=ctypes.sizeof(MEMORYSTATUSEX))
             ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
-            return stat.ullTotalPhys / (1024 ** 3)
+            return stat.ullAvailPhys / (1024 ** 3)
         except Exception:
             pass
     else:
         try:
             with open("/proc/meminfo") as f:
                 for line in f:
-                    if line.startswith("MemTotal:"):
+                    if line.startswith("MemAvailable:"):
                         return int(line.split()[1]) / (1024 ** 2)
         except Exception:
             pass
-    return 8.0  # conservative fallback
+    return 4.0  # conservative fallback
 
 
-def auto_select_model(total_ram_gb: float) -> tuple[str, int]:
-    """Pick the best Whisper model based on total physical RAM.
+def rank_models(avail_gb: float) -> list[tuple[str, int]]:
+    """Rank models from best to worst that could fit in available RAM.
 
-    Uses total RAM (not available) for a stable, repeatable decision.
-    Reserves ~4 GB for OS + typical apps (browser, IDE, etc.).
-
-    Returns (model_name, segment_seconds).
-    - If budget >= peak: no segmentation needed (segment_seconds=0)
-    - If load <= budget < peak: use model with auto-segmentation to cap peak
-    - Otherwise: try a smaller model
+    Returns list of (model_name, segment_seconds).
+    Each entry is a candidate: try the first, fall back to the next on failure.
+    Reserves 1 GB headroom for OS/other processes.
     """
-    budget = total_ram_gb - 4.0  # reserve for OS + typical workload
-
-    # Try from best to worst
+    budget = avail_gb - 1.0
+    candidates = []
     for name in ("large-v3", "turbo", "medium", "small", "base", "tiny"):
         spec = MODEL_SPECS[name]
         if budget >= spec["peak"]:
-            return name, 0  # plenty of RAM, no segmentation
-        if budget >= spec["load"] + 0.3:
-            # Can load the model, but need segmentation to stay under peak
-            return name, AUTO_SEGMENT_SEC
-    return "tiny", AUTO_SEGMENT_SEC
+            candidates.append((name, 0))
+        elif budget >= spec["load"] + 0.2:
+            candidates.append((name, AUTO_SEGMENT_SEC))
+    # Always include tiny as ultimate fallback
+    if not candidates or candidates[-1][0] != "tiny":
+        candidates.append(("tiny", AUTO_SEGMENT_SEC))
+    return candidates
 
 
 def sanitize_filename(s: str, max_len: int = 80) -> str:
@@ -319,29 +316,51 @@ def ffprobe_duration(path: str) -> float:
         return 0.0
 
 
-def load_whisper_model(cache_dir: Path, model_size: str):
+def load_whisper_model(cache_dir: Path, candidates: list[tuple[str, int]]):
+    """Try loading models from candidates list, falling back on failure.
+
+    Returns (model, model_name, segment_seconds).
+    """
     os.environ.setdefault("HF_HOME", str(cache_dir))
     os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(cache_dir))
     hf = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
     if hf:
         os.environ["HF_ENDPOINT"] = hf
     from faster_whisper import WhisperModel
-    # Check if model is already cached
-    model_dir = cache_dir / f"models--Systran--faster-whisper-{model_size}"
-    if model_dir.exists():
-        eprint(f"[info] 加载 STT 模型 ({model_size})...")
-    else:
-        eprint(f"[info] 首次使用，正在下载 STT 模型 ({model_size})，可能需要几分钟，请耐心等待...")
-    try:
-        return WhisperModel(model_size, device="cpu", compute_type="int8",
-                            download_root=str(cache_dir))
-    except Exception as e:
-        raise SystemExit(f"STT 模型加载失败: {e}")
+
+    last_err = None
+    for i, (name, seg_sec) in enumerate(candidates):
+        model_dir = cache_dir / f"models--Systran--faster-whisper-{name}"
+        if model_dir.exists():
+            eprint(f"[info] 加载 STT 模型 ({name})...")
+        else:
+            eprint(f"[info] 首次使用，正在下载 STT 模型 ({name})，可能需要几分钟，请耐心等待...")
+        try:
+            model = WhisperModel(name, device="cpu", compute_type="int8",
+                                 download_root=str(cache_dir))
+            if i > 0:
+                eprint(f"[info] 回退到 {name} 成功")
+            return model, name, seg_sec
+        except (MemoryError, OSError, RuntimeError) as e:
+            last_err = e
+            remaining = len(candidates) - i - 1
+            if remaining > 0:
+                next_name = candidates[i + 1][0]
+                eprint(f"[warn] {name} 加载失败 ({type(e).__name__})，回退到 {next_name}...")
+            else:
+                eprint(f"[error] {name} 加载失败: {e}")
+        except Exception as e:
+            # Non-memory errors (e.g. network) — don't fallback, just fail
+            raise SystemExit(f"STT 模型加载失败: {e}")
+
+    raise SystemExit(f"所有模型均加载失败，最后错误: {last_err}")
 
 
-def transcribe(audio_path: Path, cache_dir: Path, model_size: str,
-               language: str, vad: bool, beam: int, seg_sec: int) -> str:
-    model = load_whisper_model(cache_dir, model_size)
+def transcribe(audio_path: Path, cache_dir: Path, candidates: list[tuple[str, int]],
+               language: str, vad: bool, beam: int, seg_sec_override: int) -> str:
+    model, model_name, auto_seg = load_whisper_model(cache_dir, candidates)
+    # Use explicit override if set, otherwise use auto-segmentation from model selection
+    seg_sec = seg_sec_override if seg_sec_override > 0 else auto_seg
     to_process = [audio_path]
     if seg_sec > 0 and ffprobe_duration(str(audio_path)) > seg_sec:
         seg_dir = audio_path.parent / "segments"
@@ -440,18 +459,18 @@ def main():
     project_root = Path(project_root)
     stt_model = args.stt_model or cfg["sttModel"] or ""
 
-    # Auto-select model if not configured
-    if not stt_model:
-        total = get_total_ram_gb()
-        stt_model, auto_seg = auto_select_model(total)
-        seg_info = f"，自动分段 {auto_seg}s" if auto_seg else ""
-        eprint(f"[info] 总内存 {total:.0f} GB → 自动选择 STT 模型: {stt_model}{seg_info}")
-        # Apply auto-segmentation if user didn't specify
-        if auto_seg and not args.segment_seconds:
-            args.segment_seconds = auto_seg
-        # Persist the auto-selected model
-        cfg["sttModel"] = stt_model
-        save_config(cfg)
+    # Build model candidate list
+    if stt_model:
+        # User/config specified a model — use it directly (no fallback)
+        model_candidates = [(stt_model, args.segment_seconds)]
+    else:
+        # Auto-select based on current available RAM
+        avail = get_available_ram_gb()
+        model_candidates = rank_models(avail)
+        top, seg = model_candidates[0]
+        seg_info = f"，自动分段 {seg}s" if seg else ""
+        eprint(f"[info] 可用内存 {avail:.1f} GB → 首选 {top}{seg_info}"
+               f" (共 {len(model_candidates)} 个候选)")
 
     # Persist config on explicit --project-root
     if args.project_root:
@@ -460,12 +479,11 @@ def main():
             cfg["sttModel"] = args.stt_model
         save_config(cfg)
 
-    # Low-memory preset
+    # Low-memory preset: override candidates to conservative settings
     if args.low_memory:
-        stt_model = args.stt_model or "base"
+        low_model = args.stt_model or "base"
+        model_candidates = [(low_model, 180)]
         args.beam_size = 1
-        if not args.segment_seconds:
-            args.segment_seconds = 180
 
     dirs = ensure_dirs(project_root)
     require_cmds("ffmpeg", "ffprobe")
@@ -520,7 +538,7 @@ def main():
         if not args.force_stt:
             eprint("[info] 字幕不可用，转入 STT...")
         if platform == "local":
-            transcript = transcribe(Path(raw), dirs["cache"], stt_model,
+            transcript = transcribe(Path(raw), dirs["cache"], model_candidates,
                                     args.stt_language, not args.no_vad,
                                     args.beam_size, args.segment_seconds)
         else:
@@ -529,7 +547,7 @@ def main():
                          else download_audio_generic(url, Path(td)))
                 if not audio or not audio.exists():
                     raise SystemExit("无法获取音频文件")
-                transcript = transcribe(audio, dirs["cache"], stt_model,
+                transcript = transcribe(audio, dirs["cache"], model_candidates,
                                         args.stt_language, not args.no_vad,
                                         args.beam_size, args.segment_seconds)
                 if args.keep_audio:

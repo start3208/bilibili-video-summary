@@ -22,18 +22,13 @@ Set `PYTHONUTF8=1` before running to avoid GBK encoding errors:
 PYTHONUTF8=1 python video-summary.py ...
 ```
 
-### 3. STT Model (Auto-Selected)
+### 3. STT Model (Dynamic Selection with Fallback)
 
-If `sttModel` in `init.json` is empty, the script **detects total physical RAM** (not available — stable and repeatable) and picks the best model, reserving ~4 GB for OS and typical apps. When RAM budget is enough to load but tight for long audio, it **auto-segments** (2-min chunks) to cap peak memory.
+If no `--stt-model` is specified and `sttModel` in `init.json` is empty, the script **checks available RAM at runtime** and builds a ranked candidate list from best to worst. It tries the top candidate first; if loading fails (OOM), it **automatically falls back** to the next smaller model. No manual intervention needed.
 
-Example outcomes:
-
-| Total RAM | Model Selected | Segmentation |
-|-----------|---------------|-------------|
-| 4 GB | tiny | yes (120s) |
-| 5 GB | small | no |
-| 6 GB | turbo (809M) | no |
-| 7 GB+ | large-v3 (1.55B) | no |
+- When available RAM comfortably exceeds a model's peak usage → use it directly
+- When RAM is tight (enough to load but not for long audio) → auto-segment (2-min chunks) to cap peak
+- On MemoryError / load failure → silently retry with the next candidate
 
 faster-whisper, CPU, int8 quantization:
 
@@ -48,9 +43,9 @@ faster-whisper, CPU, int8 quantization:
 
 - **Load RAM**: model weights (int8) + runtime overhead, always occupied
 - **Peak RAM**: maximum during inference on long audio (~13 min) without segmentation
-- **With segmentation**: peak stays close to Load RAM — so even a 7 GB machine can run `large-v3`
+- **With segmentation**: peak stays close to Load RAM
 
-The selected model is saved to `init.json` for future runs. Override with `--stt-model <name>`.
+Override with `--stt-model <name>` to pin a specific model (disables fallback).
 
 **First STT run downloads the model** (up to ~1.5 GB for large-v3), which can take several minutes. This is normal — do NOT assume it failed or timed out. Use `--timeout 600000` (10 min) for the Bash call. Once downloaded, subsequent runs are fast.
 
