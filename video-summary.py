@@ -17,11 +17,17 @@ CONFIG_PATH = SKILL_DIR / "init.json"
 AUDIO_EXTS = {".m4a", ".mp3", ".wav", ".flac", ".aac", ".ogg", ".mp4", ".mkv", ".mov"}
 DEBUG = False
 
+# Model size → approximate RAM requirement (GB)
+MODEL_RAM_GB = {
+    "tiny": 1, "base": 1, "small": 2, "medium": 5,
+    "large-v3": 10, "turbo": 6,
+}
+
 
 # ── Config ──────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
-    defaults = {"projectRoot": "", "sttModel": "small"}
+    defaults = {"projectRoot": "", "sttModel": ""}
     if CONFIG_PATH.exists():
         try:
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -74,6 +80,93 @@ def require_cmds(*names: str):
         raise SystemExit(f"缺少依赖: {', '.join(missing)}")
 
 
+def get_available_ram_gb() -> float:
+    """Return available RAM in GB."""
+    try:
+        import psutil
+        return psutil.virtual_memory().available / (1024 ** 3)
+    except ImportError:
+        pass
+    # Fallback: read from OS
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            stat = MEMORYSTATUSEX(dwLength=ctypes.sizeof(MEMORYSTATUSEX))
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            return stat.ullAvailPhys / (1024 ** 3)
+        except Exception:
+            pass
+    else:
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) / (1024 ** 2)
+        except Exception:
+            pass
+    return 4.0  # conservative fallback
+
+
+def auto_select_model() -> str:
+    """Pick the best Whisper model that fits in available RAM (with 2 GB headroom)."""
+    avail = get_available_ram_gb() - 2.0  # reserve headroom
+    # Try from best to worst
+    for model in ("large-v3", "turbo", "medium", "small", "base", "tiny"):
+        if MODEL_RAM_GB[model] <= avail:
+            return model
+    return "tiny"
+
+
+def sanitize_filename(s: str, max_len: int = 80) -> str:
+    """Clean a string for use in filenames."""
+    s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    s = s.strip('. ')
+    if len(s) > max_len:
+        s = s[:max_len].rstrip()
+    return s
+
+
+def fetch_title_bilibili(url: str) -> str:
+    """Get video title via yutto --info-only."""
+    try:
+        r = run([sys.executable, "-m", "yutto", url, "--info-only"], check=False)
+        # yutto --info-only prints title in output
+        for line in (r.stdout + r.stderr).splitlines():
+            # yutto prints: Title: xxx  or just the title line
+            if line.strip():
+                # Look for a line that looks like a title
+                m = re.match(r'(?:Title|标题)\s*[:：]\s*(.+)', line.strip(), re.I)
+                if m:
+                    return m.group(1).strip()
+        # Fallback: try yt-dlp if available
+        if shutil.which("yt-dlp"):
+            return fetch_title_generic(url)
+    except Exception:
+        pass
+    return ""
+
+
+def fetch_title_generic(url: str) -> str:
+    """Get video title via yt-dlp."""
+    try:
+        r = run(["yt-dlp", "--get-title", "--no-download", url], check=False)
+        title = r.stdout.strip().splitlines()
+        return title[0] if title else ""
+    except Exception:
+        return ""
+
+
 # ── Input parsing ───────────────────────────────────────────────────────
 
 def normalize_input(s: str) -> str:
@@ -109,8 +202,13 @@ def extract_video_id(url: str, platform: str) -> str:
     return ""
 
 
-def transcript_key(platform: str, video_id: str) -> str:
-    return f"{platform}-{video_id}" if video_id else f"{platform}-{int(time.time())}"
+def transcript_key(platform: str, video_id: str, title: str = "") -> str:
+    base = f"{platform}-{video_id}" if video_id else f"{platform}-{int(time.time())}"
+    if title:
+        safe = sanitize_filename(title, max_len=60)
+        if safe:
+            return f"{base}-{safe}"
+    return base
 
 
 # ── Subtitle extraction ────────────────────────────────────────────────
@@ -313,7 +411,15 @@ def main():
             f'  python "{Path(__file__).name}" "BV1xxx" --project-root "D:/video-summary"'
         )
     project_root = Path(project_root)
-    stt_model = args.stt_model or cfg["sttModel"] or "small"
+    stt_model = args.stt_model or cfg["sttModel"] or ""
+
+    # Auto-select model if not configured
+    if not stt_model:
+        stt_model = auto_select_model()
+        eprint(f"[info] 可用内存 {get_available_ram_gb():.1f} GB，自动选择 STT 模型: {stt_model}")
+        # Persist the auto-selected model
+        cfg["sttModel"] = stt_model
+        save_config(cfg)
 
     # Persist config on explicit --project-root
     if args.project_root:
@@ -337,8 +443,28 @@ def main():
     url = normalize_input(raw)
     platform = detect_platform(raw)
     vid = extract_video_id(url, platform)
-    key = transcript_key(platform, vid)
+
+    # Fetch video title for meaningful filenames
+    title = ""
+    if platform == "bilibili":
+        title = fetch_title_bilibili(url)
+    elif platform not in ("local", "unknown"):
+        title = fetch_title_generic(url)
+    if title:
+        eprint(f"[info] 视频标题: {title}")
+
+    key = transcript_key(platform, vid, title)
     tp = dirs["transcripts"] / f"{key}.txt"
+
+    # Cache check — also try legacy key (without title) for backward compat
+    legacy_tp = dirs["transcripts"] / f"{transcript_key(platform, vid)}.txt"
+    if not tp.exists() and legacy_tp.exists() and not args.force_stt:
+        # Rename legacy file to include title
+        if title:
+            legacy_tp.rename(tp)
+            eprint(f"[info] 已将旧缓存重命名: {legacy_tp.name} -> {tp.name}")
+        else:
+            tp = legacy_tp
 
     # Cache check
     if tp.exists() and not args.force_stt:

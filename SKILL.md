@@ -22,9 +22,17 @@ Set `PYTHONUTF8=1` before running to avoid GBK encoding errors:
 PYTHONUTF8=1 python video-summary.py ...
 ```
 
-### 3. STT Model Download (First Time)
+### 3. STT Model (Auto-Selected)
 
-If subtitles are unavailable, the script falls back to Whisper STT. **The first STT run downloads a ~500 MB model**, which can take several minutes. This is normal — do NOT assume it failed or timed out. Use `--timeout 600000` (10 min) for the Bash call, or run it in the background. Once downloaded, the model is cached and subsequent runs are fast.
+If `sttModel` in `init.json` is empty, the script **auto-detects available RAM** and picks the best model that fits:
+- `large-v3` (~10 GB) — best quality
+- `turbo` (~6 GB) — fast and good
+- `medium` (~5 GB) — balanced
+- `small` (~2 GB) / `base` (~1 GB) / `tiny` (~1 GB) — lightweight
+
+The selected model is saved to `init.json` for future runs. Override with `--stt-model <name>`.
+
+**First STT run downloads the model** (~500 MB+), which can take several minutes. This is normal — do NOT assume it failed or timed out. Use `--timeout 600000` (10 min) for the Bash call. Once downloaded, subsequent runs are fast.
 
 ## Dependencies
 
@@ -55,7 +63,7 @@ python video-summary.py "https://www.youtube.com/watch?v=xxx"
 python video-summary.py "path/to/audio.mp3" --force-stt
 ```
 
-Transcripts are cached by video ID in `{projectRoot}/transcripts/`. Repeated runs skip extraction.
+Transcripts are cached by video ID and title in `{projectRoot}/transcripts/`, e.g. `bilibili-BV1xxx-视频标题.txt`. Repeated runs skip extraction.
 
 ## Important Notes
 
