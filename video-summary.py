@@ -66,14 +66,37 @@ def debug(msg: str):
 
 
 def run(cmd, *, check=True, env=None):
+    """Run a subprocess and return the result with properly decoded text.
+
+    Reads raw bytes and tries UTF-8 first, then GBK (common on Chinese Windows).
+    This avoids garbled output when subprocesses ignore PYTHONUTF8.
+    """
     debug(f"run: {subprocess.list2cmdline([str(x) for x in cmd])}")
     merged = os.environ.copy()
     merged.setdefault("PYTHONUTF8", "1")
     merged.setdefault("PYTHONIOENCODING", "utf-8")
     if env:
         merged.update(env)
-    return subprocess.run(cmd, check=check, text=True, capture_output=True,
-                          encoding="utf-8", errors="replace", env=merged)
+    result = subprocess.run(cmd, check=check, capture_output=True, env=merged)
+    # Decode stdout/stderr: try UTF-8, fall back to GBK
+    result.stdout = _decode(result.stdout)
+    result.stderr = _decode(result.stderr)
+    return result
+
+
+def _decode(data: bytes) -> str:
+    """Decode bytes trying UTF-8 first, then GBK, then lossy UTF-8."""
+    if not data:
+        return ""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    try:
+        return data.decode("gbk")
+    except UnicodeDecodeError:
+        pass
+    return data.decode("utf-8", errors="replace")
 
 
 def require_cmds(*names: str):
@@ -85,6 +108,7 @@ def require_cmds(*names: str):
 def sanitize_filename(s: str, max_len: int = 80) -> str:
     """Clean a string for use in filenames."""
     s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', s)
+    s = s.replace('\ufffd', '')  # remove Unicode replacement chars (garbled decoding)
     s = re.sub(r'\s+', ' ', s).strip()
     s = s.strip('. ')
     if len(s) > max_len:
