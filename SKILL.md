@@ -24,20 +24,26 @@ PYTHONUTF8=1 python video-summary.py ...
 
 ### 3. STT Model (Auto-Selected)
 
-If `sttModel` in `init.json` is empty, the script **auto-detects available RAM** and picks the best model that fits (faster-whisper, CPU, int8 quantization):
+If `sttModel` in `init.json` is empty, the script **auto-detects available RAM** and picks the best model that fits. When RAM is enough to load the model but tight for long audio, it **automatically enables segmented transcription** (2-min chunks) to keep peak memory low.
 
-| Model | Parameters | RAM (CPU int8) | Notes |
-|-------|-----------|----------------|-------|
-| `large-v3` | 1.55B | ~5 GB | Best quality, 32 decoder layers |
-| `turbo` | 809M | ~3 GB | large-v3-turbo, 4 decoder layers, ~8x faster than large |
-| `medium` | 769M | ~2.5 GB | Balanced |
-| `small` | 244M | ~1 GB | Lightweight |
-| `base` | 74M | ~0.5 GB | Minimal |
-| `tiny` | 39M | ~0.5 GB | Fastest, lowest quality |
+faster-whisper, CPU, int8 quantization:
+
+| Model | Parameters | Load RAM | Peak RAM (long audio) | Notes |
+|-------|-----------|----------|----------------------|-------|
+| `large-v3` | 1.55B | ~1.8 GB | ~2.3 GB | Best quality, 32 decoder layers |
+| `turbo` | 809M | ~1.3 GB | ~1.7 GB | large-v3-turbo, 4 decoder layers, ~8x faster |
+| `medium` | 769M | ~1.2 GB | ~1.6 GB | Balanced |
+| `small` | 244M | ~0.6 GB | ~0.8 GB | Lightweight |
+| `base` | 74M | ~0.4 GB | ~0.5 GB | Minimal |
+| `tiny` | 39M | ~0.3 GB | ~0.4 GB | Fastest, lowest quality |
+
+- **Load RAM**: model weights (int8) + runtime overhead, always occupied
+- **Peak RAM**: maximum during inference on long audio (~13 min) without segmentation
+- **With segmentation**: peak stays close to Load RAM — so even a 4 GB machine can run `large-v3`
 
 The selected model is saved to `init.json` for future runs. Override with `--stt-model <name>`.
 
-**First STT run downloads the model** (~500 MB+), which can take several minutes. This is normal — do NOT assume it failed or timed out. Use `--timeout 600000` (10 min) for the Bash call. Once downloaded, subsequent runs are fast.
+**First STT run downloads the model** (up to ~1.5 GB for large-v3), which can take several minutes. This is normal — do NOT assume it failed or timed out. Use `--timeout 600000` (10 min) for the Bash call. Once downloaded, subsequent runs are fast.
 
 ## Dependencies
 

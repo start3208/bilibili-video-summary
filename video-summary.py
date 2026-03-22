@@ -17,19 +17,25 @@ CONFIG_PATH = SKILL_DIR / "init.json"
 AUDIO_EXTS = {".m4a", ".mp3", ".wav", ".flac", ".aac", ".ogg", ".mp4", ".mkv", ".mov"}
 DEBUG = False
 
-# Whisper model specs for auto-selection.
-# Parameters from OpenAI; RAM figures are for faster-whisper CPU int8 inference
-# (roughly 40-50% of the official GPU float16 VRAM requirements).
-# Sources: https://github.com/openai/whisper, https://github.com/SYSTRAN/faster-whisper
+# Whisper model specs for auto-selection (faster-whisper, CPU, int8 quantization).
+# - params: from OpenAI official table
+# - load_ram: model weights in int8 + CTranslate2 runtime overhead (~0.3 GB)
+# - peak_ram: observed peak during long audio (~13 min) without segmentation
+# With --segment-seconds, peak stays close to load_ram.
+# Sources: https://github.com/openai/whisper
+#          https://github.com/SYSTRAN/faster-whisper (benchmarks)
 MODEL_SPECS = {
-    #                 params    RAM (GB, CPU int8)
-    "tiny":          (39_000_000,   0.5),
-    "base":          (74_000_000,   0.5),
-    "small":        (244_000_000,   1.0),
-    "medium":       (769_000_000,   2.5),
-    "turbo":        (809_000_000,   3.0),   # large-v3-turbo, 4 decoder layers
-    "large-v3":   (1_550_000_000,   5.0),   # 32 decoder layers
+    #                params        load_ram  peak_ram (GB, CPU int8)
+    "tiny":       {"params":  39_000_000, "load": 0.3, "peak": 0.4},
+    "base":       {"params":  74_000_000, "load": 0.4, "peak": 0.5},
+    "small":      {"params": 244_000_000, "load": 0.6, "peak": 0.8},
+    "medium":     {"params": 769_000_000, "load": 1.2, "peak": 1.6},
+    "turbo":      {"params": 809_000_000, "load": 1.3, "peak": 1.7},  # large-v3-turbo, 4 decoder layers
+    "large-v3":   {"params":1_550_000_000,"load": 1.8, "peak": 2.3},  # 32 decoder layers
 }
+
+# Auto-segmentation threshold: if available RAM < peak but >= load, split audio
+AUTO_SEGMENT_SEC = 120  # 2-minute chunks keep peak RAM close to load_ram
 
 
 # ── Config ──────────────────────────────────────────────────────────────
@@ -125,14 +131,26 @@ def get_available_ram_gb() -> float:
     return 4.0  # conservative fallback
 
 
-def auto_select_model() -> str:
-    """Pick the best Whisper model that fits in available RAM (with 2 GB headroom)."""
-    avail = get_available_ram_gb() - 2.0  # reserve headroom
+def auto_select_model(avail_gb: float) -> tuple[str, int]:
+    """Pick the best Whisper model for available RAM.
+
+    Returns (model_name, segment_seconds).
+    - If RAM >= peak: no segmentation needed (segment_seconds=0)
+    - If load <= RAM < peak: use model with auto-segmentation to cap peak
+    - Otherwise: try a smaller model
+    """
+    headroom = 1.0  # GB reserved for OS and other processes
+    usable = avail_gb - headroom
+
     # Try from best to worst
-    for model in ("large-v3", "turbo", "medium", "small", "base", "tiny"):
-        if MODEL_SPECS[model][1] <= avail:
-            return model
-    return "tiny"
+    for name in ("large-v3", "turbo", "medium", "small", "base", "tiny"):
+        spec = MODEL_SPECS[name]
+        if usable >= spec["peak"]:
+            return name, 0  # plenty of RAM, no segmentation
+        if usable >= spec["load"] + 0.3:
+            # Can load the model, but need segmentation to stay under peak
+            return name, AUTO_SEGMENT_SEC
+    return "tiny", AUTO_SEGMENT_SEC
 
 
 def sanitize_filename(s: str, max_len: int = 80) -> str:
@@ -423,8 +441,13 @@ def main():
 
     # Auto-select model if not configured
     if not stt_model:
-        stt_model = auto_select_model()
-        eprint(f"[info] 可用内存 {get_available_ram_gb():.1f} GB，自动选择 STT 模型: {stt_model}")
+        avail = get_available_ram_gb()
+        stt_model, auto_seg = auto_select_model(avail)
+        seg_info = f"，自动分段 {auto_seg}s" if auto_seg else ""
+        eprint(f"[info] 可用内存 {avail:.1f} GB → 自动选择 STT 模型: {stt_model}{seg_info}")
+        # Apply auto-segmentation if user didn't specify
+        if auto_seg and not args.segment_seconds:
+            args.segment_seconds = auto_seg
         # Persist the auto-selected model
         cfg["sttModel"] = stt_model
         save_config(cfg)
